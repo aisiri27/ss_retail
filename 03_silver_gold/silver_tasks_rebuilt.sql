@@ -1,0 +1,342 @@
+-- ============================================================
+-- FILE NAME: silver_tasks_rebuilt.sql
+-- Project : S&S Retail — End-to-End Snowflake Pipeline
+-- Run this FOURTH, after fallback_load_task.sql
+--
+-- Creates all 4 Silver tasks, each running AFTER the primary
+-- Bronze load (not a fixed timer).
+--
+-- REFRESH STRATEGY:
+--   TRANSACTIONS - incremental MERGE from stream (fact table)
+--                  WHEN gate: fires only when stream has data
+--   INVENTORY    - incremental MERGE from stream + DATE PRUNING
+--                  (fact table, 1.4B rows)
+--                  WHEN gate: fires only when stream has data
+--   PRODUCT      - full refresh CREATE OR REPLACE (dimension)
+--                  NO WHEN gate: fires unconditionally after Bronze
+--   STORE        - full refresh CREATE OR REPLACE (dimension)
+--                  NO WHEN gate: fires unconditionally after Bronze
+--
+-- WHY PRODUCT/STORE HAVE NO WHEN GATE:
+--   Product and Store are full-refresh snapshots. Their task bodies
+--   read the base Bronze table directly (not the stream), so the
+--   stream is never actually consumed. An unconsumed stream goes
+--   stale after ~14 days (Snowflake's retention window), causing
+--   the WHEN gate to error with "stream has become stale."
+--   Removing the gate makes Product/Store fire unconditionally,
+--   which is correct since they always need refreshing after Bronze.
+--   This change was deployed 2026-07-21 to fix the recurring
+--   STREAM_PRODUCT / STREAM_STORE stale-stream failures.
+--
+-- WHY TRANSACTIONS/INVENTORY KEEP THE WHEN GATE:
+--   These tasks actually consume the stream (MERGE reads FROM the
+--   stream directly). Consuming the stream resets its staleness
+--   clock daily. The gate is safe and useful -- skips the MERGE
+--   on days when Bronze had no new files.
+--
+-- ROLLBACK: silver_tasks_fullrefresh_backup.sql holds the
+--   all-full-refresh version of all 4 tasks.
+-- ============================================================
+
+USE ROLE SNOWFLAKE_LEARNING_ROLE;
+USE DATABASE DB_TEAM1;
+USE WAREHOUSE SNOWFLAKE_LEARNING_WH;
+
+-- suspend root first, then children
+ALTER TASK DB_TEAM1.BRONZE.TASK_DAILY_BRONZE_LOAD        SUSPEND;
+ALTER TASK IF EXISTS DB_TEAM1.BRONZE.TASK_SILVER_TRANSACTIONS SUSPEND;
+ALTER TASK IF EXISTS DB_TEAM1.BRONZE.TASK_SILVER_INVENTORY    SUSPEND;
+ALTER TASK IF EXISTS DB_TEAM1.BRONZE.TASK_SILVER_PRODUCT      SUSPEND;
+ALTER TASK IF EXISTS DB_TEAM1.BRONZE.TASK_SILVER_STORE        SUSPEND;
+ALTER TASK IF EXISTS DB_TEAM1.BRONZE.TASK_GOLD_REFRESH        SUSPEND;
+
+
+-- ============================================================
+-- SILVER TRANSACTIONS — INCREMENTAL MERGE (fact table)
+-- Reads only new rows from STREAM_TRANSACTIONS, upserts into Silver.
+-- WHEN gate kept: stream is actually consumed by the MERGE daily.
+-- Merge key: TRANSACTION_ID + LINE_ID
+-- ============================================================
+CREATE OR REPLACE TASK DB_TEAM1.BRONZE.TASK_SILVER_TRANSACTIONS
+    WAREHOUSE = SNOWFLAKE_LEARNING_WH
+    COMMENT   = 'Incremental MERGE of new Bronze transactions into Silver (reads from stream)'
+    AFTER DB_TEAM1.BRONZE.TASK_DAILY_BRONZE_LOAD
+    WHEN SYSTEM$STREAM_HAS_DATA('DB_TEAM1.BRONZE.STREAM_TRANSACTIONS')
+AS
+MERGE INTO DB_TEAM1.SILVER.TRANSACTIONS AS TGT
+USING (
+    SELECT
+        CHANNEL_ID, CHANNEL_DESC, TRANSACTION_ID,
+        TRY_TO_DATE(TRANSACTION_DATE::STRING)           AS TRANSACTION_DATE,
+        TRANSACTION_TYPE,
+        LINE_ID::NUMBER                                 AS LINE_ID,
+        SKU_ID, STORE_ID_ORIGIN, STORE_ID_FULLFILLED,
+        ORDER_FULFILLMENT_METHOD,
+        QUANTITY_SOLD::NUMBER                           AS QUANTITY_SOLD,
+        CURRENT_MSRP::FLOAT                             AS CURRENT_MSRP,
+        UNIT_RETAIL_PRICE::FLOAT                        AS UNIT_RETAIL_PRICE,
+        DISCOUNT_AMOUNT::FLOAT                          AS DISCOUNT_AMOUNT,
+        UNIT_NET_SELLING_PRICE::FLOAT                   AS UNIT_NET_SELLING_PRICE,
+        TOTAL_EXTENDED_LINE_AMOUNT::FLOAT               AS TOTAL_EXTENDED_LINE_AMOUNT,
+        UNIT_COST::FLOAT                                AS UNIT_COST,
+        TOTAL_COST::FLOAT                               AS TOTAL_COST,
+        PRICE_STATUS, CLEARANCE_INDICATOR,
+        TRY_TO_DATE(LAUNCH_DATE::STRING)                AS LAUNCH_DATE,
+        LAUNCH_PRICE::FLOAT                             AS LAUNCH_PRICE,
+        TRY_TO_TIMESTAMP(REPLACE(CREATED_TIMESTAMP, '-', ' '), 'YYYY MM DD HH24.MI.SS.FF6') AS CREATED_TIMESTAMP,
+        TRY_TO_TIMESTAMP(REPLACE(UPDATED_TIMESTAMP, '-', ' '), 'YYYY MM DD HH24.MI.SS.FF6') AS UPDATED_TIMESTAMP,
+        _SOURCE_FILE, _LOADED_AT,
+        CURRENT_TIMESTAMP()                             AS _STAGED_AT,
+        CASE WHEN TRANSACTION_ID IS NULL THEN 'FAIL' ELSE 'PASS' END AS DQ_TRANSACTION_ID,
+        CASE WHEN SKU_ID IS NULL THEN 'FAIL' ELSE 'PASS' END         AS DQ_SKU_ID,
+        CASE WHEN STORE_ID_ORIGIN IS NULL THEN 'FAIL' ELSE 'PASS' END AS DQ_STORE_ID,
+        CASE WHEN QUANTITY_SOLD IS NULL OR QUANTITY_SOLD::NUMBER < 0 THEN 'FAIL' ELSE 'PASS' END AS DQ_QUANTITY,
+        CASE WHEN TOTAL_EXTENDED_LINE_AMOUNT IS NULL OR TOTAL_EXTENDED_LINE_AMOUNT::FLOAT < 0 THEN 'FAIL' ELSE 'PASS' END AS DQ_AMOUNT
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY TRANSACTION_ID, LINE_ID
+                ORDER BY _LOADED_AT DESC
+            ) AS RN
+        FROM DB_TEAM1.BRONZE.STREAM_TRANSACTIONS
+    )
+    WHERE RN = 1
+) AS SRC
+ON  TGT.TRANSACTION_ID = SRC.TRANSACTION_ID
+AND TGT.LINE_ID        = SRC.LINE_ID
+WHEN MATCHED THEN UPDATE SET
+    TGT.CHANNEL_ID = SRC.CHANNEL_ID, TGT.CHANNEL_DESC = SRC.CHANNEL_DESC,
+    TGT.TRANSACTION_DATE = SRC.TRANSACTION_DATE, TGT.TRANSACTION_TYPE = SRC.TRANSACTION_TYPE,
+    TGT.SKU_ID = SRC.SKU_ID, TGT.STORE_ID_ORIGIN = SRC.STORE_ID_ORIGIN,
+    TGT.STORE_ID_FULLFILLED = SRC.STORE_ID_FULLFILLED,
+    TGT.ORDER_FULFILLMENT_METHOD = SRC.ORDER_FULFILLMENT_METHOD,
+    TGT.QUANTITY_SOLD = SRC.QUANTITY_SOLD, TGT.CURRENT_MSRP = SRC.CURRENT_MSRP,
+    TGT.UNIT_RETAIL_PRICE = SRC.UNIT_RETAIL_PRICE, TGT.DISCOUNT_AMOUNT = SRC.DISCOUNT_AMOUNT,
+    TGT.UNIT_NET_SELLING_PRICE = SRC.UNIT_NET_SELLING_PRICE,
+    TGT.TOTAL_EXTENDED_LINE_AMOUNT = SRC.TOTAL_EXTENDED_LINE_AMOUNT,
+    TGT.UNIT_COST = SRC.UNIT_COST, TGT.TOTAL_COST = SRC.TOTAL_COST,
+    TGT.PRICE_STATUS = SRC.PRICE_STATUS, TGT.CLEARANCE_INDICATOR = SRC.CLEARANCE_INDICATOR,
+    TGT.LAUNCH_DATE = SRC.LAUNCH_DATE, TGT.LAUNCH_PRICE = SRC.LAUNCH_PRICE,
+    TGT.CREATED_TIMESTAMP = SRC.CREATED_TIMESTAMP, TGT.UPDATED_TIMESTAMP = SRC.UPDATED_TIMESTAMP,
+    TGT._SOURCE_FILE = SRC._SOURCE_FILE, TGT._LOADED_AT = SRC._LOADED_AT,
+    TGT._STAGED_AT = SRC._STAGED_AT,
+    TGT.DQ_TRANSACTION_ID = SRC.DQ_TRANSACTION_ID, TGT.DQ_SKU_ID = SRC.DQ_SKU_ID,
+    TGT.DQ_STORE_ID = SRC.DQ_STORE_ID, TGT.DQ_QUANTITY = SRC.DQ_QUANTITY,
+    TGT.DQ_AMOUNT = SRC.DQ_AMOUNT
+WHEN NOT MATCHED THEN INSERT (
+    CHANNEL_ID, CHANNEL_DESC, TRANSACTION_ID, TRANSACTION_DATE, TRANSACTION_TYPE,
+    LINE_ID, SKU_ID, STORE_ID_ORIGIN, STORE_ID_FULLFILLED, ORDER_FULFILLMENT_METHOD,
+    QUANTITY_SOLD, CURRENT_MSRP, UNIT_RETAIL_PRICE, DISCOUNT_AMOUNT,
+    UNIT_NET_SELLING_PRICE, TOTAL_EXTENDED_LINE_AMOUNT, UNIT_COST, TOTAL_COST,
+    PRICE_STATUS, CLEARANCE_INDICATOR, LAUNCH_DATE, LAUNCH_PRICE,
+    CREATED_TIMESTAMP, UPDATED_TIMESTAMP, _SOURCE_FILE, _LOADED_AT, _STAGED_AT,
+    DQ_TRANSACTION_ID, DQ_SKU_ID, DQ_STORE_ID, DQ_QUANTITY, DQ_AMOUNT
+) VALUES (
+    SRC.CHANNEL_ID, SRC.CHANNEL_DESC, SRC.TRANSACTION_ID, SRC.TRANSACTION_DATE,
+    SRC.TRANSACTION_TYPE, SRC.LINE_ID, SRC.SKU_ID, SRC.STORE_ID_ORIGIN,
+    SRC.STORE_ID_FULLFILLED, SRC.ORDER_FULFILLMENT_METHOD, SRC.QUANTITY_SOLD,
+    SRC.CURRENT_MSRP, SRC.UNIT_RETAIL_PRICE, SRC.DISCOUNT_AMOUNT,
+    SRC.UNIT_NET_SELLING_PRICE, SRC.TOTAL_EXTENDED_LINE_AMOUNT,
+    SRC.UNIT_COST, SRC.TOTAL_COST, SRC.PRICE_STATUS, SRC.CLEARANCE_INDICATOR,
+    SRC.LAUNCH_DATE, SRC.LAUNCH_PRICE, SRC.CREATED_TIMESTAMP, SRC.UPDATED_TIMESTAMP,
+    SRC._SOURCE_FILE, SRC._LOADED_AT, SRC._STAGED_AT,
+    SRC.DQ_TRANSACTION_ID, SRC.DQ_SKU_ID, SRC.DQ_STORE_ID, SRC.DQ_QUANTITY, SRC.DQ_AMOUNT
+);
+
+
+-- ============================================================
+-- SILVER INVENTORY — INCREMENTAL MERGE v2 (fact table, 1.4B rows)
+-- Reads only new rows from STREAM_INVENTORY, upserts into Silver.
+-- DATE PRUNING: TGT.INVENTORY_DATE >= min date in the batch skips
+-- ~479 days of partitions (avoids the full-table scan that timed out).
+-- WHEN gate kept: stream is actually consumed by the MERGE daily.
+-- Merge key: CHANNEL_ID + SKU_ID + STORE_ID + INVENTORY_DATE
+-- ============================================================
+CREATE OR REPLACE TASK DB_TEAM1.BRONZE.TASK_SILVER_INVENTORY
+    WAREHOUSE         = SNOWFLAKE_LEARNING_WH
+    COMMENT           = 'Incremental MERGE v2 of new Bronze inventory into Silver (stream + date pruning)'
+    USER_TASK_TIMEOUT_MS = 7200000
+    AFTER DB_TEAM1.BRONZE.TASK_DAILY_BRONZE_LOAD
+    WHEN SYSTEM$STREAM_HAS_DATA('DB_TEAM1.BRONZE.STREAM_INVENTORY')
+AS
+DECLARE
+    v_min_date DATE;
+BEGIN
+    SELECT MIN(TRY_TO_DATE(INVENTORY_DATE::STRING)) INTO :v_min_date
+    FROM DB_TEAM1.BRONZE.STREAM_INVENTORY;
+
+    MERGE INTO DB_TEAM1.SILVER.INVENTORY AS TGT
+    USING (
+        SELECT
+            CHANNEL_ID, CHANNEL_DESC, SKU_ID,
+            STORE_ID::NUMBER                    AS STORE_ID,
+            TRY_TO_DATE(INVENTORY_DATE::STRING) AS INVENTORY_DATE,
+            ONHAND_QTY::NUMBER                  AS ONHAND_QTY,
+            INTRANSIT_QTY::NUMBER               AS INTRANSIT_QTY,
+            ONORDER_QTY::NUMBER                 AS ONORDER_QTY,
+            RECEIPTS_QTY::NUMBER                AS RECEIPTS_QTY,
+            DROP_SHIP_QTY::NUMBER               AS DROP_SHIP_QTY,
+            _SOURCE_FILE, _LOADED_AT,
+            CURRENT_TIMESTAMP()                 AS _STAGED_AT,
+            CASE WHEN SKU_ID IS NULL THEN 'FAIL' ELSE 'PASS' END         AS DQ_SKU_ID,
+            CASE WHEN STORE_ID IS NULL THEN 'FAIL' ELSE 'PASS' END       AS DQ_STORE_ID,
+            CASE WHEN INVENTORY_DATE IS NULL THEN 'FAIL' ELSE 'PASS' END AS DQ_INVENTORY_DATE,
+            CASE WHEN ONHAND_QTY::NUMBER < 0 THEN 'FAIL' ELSE 'PASS' END AS DQ_ONHAND_QTY
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CHANNEL_ID, SKU_ID, STORE_ID, INVENTORY_DATE
+                    ORDER BY _LOADED_AT DESC
+                ) AS RN
+            FROM DB_TEAM1.BRONZE.STREAM_INVENTORY
+        )
+        WHERE RN = 1
+    ) AS SRC
+    ON  TGT.INVENTORY_DATE >= :v_min_date
+    AND TGT.CHANNEL_ID      = SRC.CHANNEL_ID
+    AND TGT.SKU_ID          = SRC.SKU_ID
+    AND TGT.STORE_ID        = SRC.STORE_ID
+    AND TGT.INVENTORY_DATE  = SRC.INVENTORY_DATE
+    WHEN MATCHED THEN UPDATE SET
+        TGT.CHANNEL_DESC = SRC.CHANNEL_DESC, TGT.ONHAND_QTY = SRC.ONHAND_QTY,
+        TGT.INTRANSIT_QTY = SRC.INTRANSIT_QTY, TGT.ONORDER_QTY = SRC.ONORDER_QTY,
+        TGT.RECEIPTS_QTY = SRC.RECEIPTS_QTY, TGT.DROP_SHIP_QTY = SRC.DROP_SHIP_QTY,
+        TGT._SOURCE_FILE = SRC._SOURCE_FILE, TGT._LOADED_AT = SRC._LOADED_AT,
+        TGT._STAGED_AT = SRC._STAGED_AT,
+        TGT.DQ_SKU_ID = SRC.DQ_SKU_ID, TGT.DQ_STORE_ID = SRC.DQ_STORE_ID,
+        TGT.DQ_INVENTORY_DATE = SRC.DQ_INVENTORY_DATE, TGT.DQ_ONHAND_QTY = SRC.DQ_ONHAND_QTY
+    WHEN NOT MATCHED THEN INSERT (
+        CHANNEL_ID, CHANNEL_DESC, SKU_ID, STORE_ID, INVENTORY_DATE,
+        ONHAND_QTY, INTRANSIT_QTY, ONORDER_QTY, RECEIPTS_QTY, DROP_SHIP_QTY,
+        _SOURCE_FILE, _LOADED_AT, _STAGED_AT,
+        DQ_SKU_ID, DQ_STORE_ID, DQ_INVENTORY_DATE, DQ_ONHAND_QTY
+    ) VALUES (
+        SRC.CHANNEL_ID, SRC.CHANNEL_DESC, SRC.SKU_ID, SRC.STORE_ID, SRC.INVENTORY_DATE,
+        SRC.ONHAND_QTY, SRC.INTRANSIT_QTY, SRC.ONORDER_QTY, SRC.RECEIPTS_QTY, SRC.DROP_SHIP_QTY,
+        SRC._SOURCE_FILE, SRC._LOADED_AT, SRC._STAGED_AT,
+        SRC.DQ_SKU_ID, SRC.DQ_STORE_ID, SRC.DQ_INVENTORY_DATE, SRC.DQ_ONHAND_QTY
+    );
+END;
+
+
+-- ============================================================
+-- SILVER PRODUCT — FULL REFRESH (dimension / snapshot)
+-- NO WHEN gate: fires unconditionally after Bronze.
+-- Reason: task body reads Bronze base table directly (not the stream),
+-- so the stream was never consumed and went stale after ~14 days.
+-- Removing the gate fixes the recurring 091092 stale-stream error.
+-- ============================================================
+CREATE OR REPLACE TASK DB_TEAM1.BRONZE.TASK_SILVER_PRODUCT
+    WAREHOUSE = SNOWFLAKE_LEARNING_WH
+    COMMENT   = 'Full refresh of Silver Product from Bronze, runs after primary load'
+    AFTER DB_TEAM1.BRONZE.TASK_DAILY_BRONZE_LOAD
+    -- NO WHEN clause: fires unconditionally (stream gate removed 2026-07-21)
+AS
+CREATE OR REPLACE TABLE DB_TEAM1.SILVER.PRODUCT AS
+SELECT
+    DIVISION_CODE, DIVISION_DESC, DEPARTMENT_CODE, DEPARTMENT_DESC,
+    CLASS_CODE, CLASS_DESC, SUBCLASS_CODE, SUBCLASS_DESC,
+    VENDOR_ID, VENDOR_NAME, STYLE_ID, STYLE_DESC, COLOR_ID,
+    COLOR_DESC, COLOR_FAMILY_DESC, SIZE, SKU_ID, PRODUCT_STATUS,
+    UNIT_RETAIL_PRICE::FLOAT            AS UNIT_RETAIL_PRICE,
+    UNIT_LAUNCH_PRICE::FLOAT            AS UNIT_LAUNCH_PRICE,
+    CURRENT_MSRP::FLOAT                 AS CURRENT_MSRP,
+    UNIT_COST::FLOAT                    AS UNIT_COST,
+    TRY_TO_DATE(LAUNCH_DATE::STRING)    AS LAUNCH_DATE,
+    SEASON_CODE, SEASON_CODE_DESC, FASHION_GRADE, EAN,
+    CARRYOVER, COLLECTION, PRICE_STATUS,
+    TRY_TO_DATE(EXIT_DATE::STRING)      AS EXIT_DATE,
+    BRAND, MATERIAL, PRODUCT_LIFE_CYCLE,
+    TRY_TO_TIMESTAMP(
+        REPLACE(CREATED_TIMESTAMP, '-', ' '),
+        'YYYY MM DD HH24.MI.SS.FF6'
+    )                                   AS CREATED_TIMESTAMP,
+    TRY_TO_TIMESTAMP(
+        REPLACE(UPDATED_TIMESTAMP, '-', ' '),
+        'YYYY MM DD HH24.MI.SS.FF6'
+    )                                   AS UPDATED_TIMESTAMP,
+    _SOURCE_FILE, _LOADED_AT,
+    CURRENT_TIMESTAMP()                 AS _STAGED_AT,
+    CASE WHEN SKU_ID IS NULL THEN 'FAIL' ELSE 'PASS' END                          AS DQ_SKU_ID,
+    CASE WHEN PRODUCT_STATUS IS NULL THEN 'FAIL' ELSE 'PASS' END                  AS DQ_PRODUCT_STATUS,
+    CASE WHEN UNIT_RETAIL_PRICE IS NULL OR UNIT_RETAIL_PRICE::FLOAT < 0
+         THEN 'FAIL' ELSE 'PASS' END                                               AS DQ_PRICE
+FROM (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY SKU_ID
+            ORDER BY _LOADED_AT DESC
+        ) AS RN
+    FROM DB_TEAM1.BRONZE.PRODUCT
+)
+WHERE RN = 1;
+
+
+-- ============================================================
+-- SILVER STORE — FULL REFRESH (dimension / snapshot)
+-- NO WHEN gate: fires unconditionally after Bronze.
+-- Same reason as Product: stream was not consumed, went stale.
+-- ~154 active stores (Aperto + Chiuso); status reflects today's
+-- file which is the current snapshot.
+-- ============================================================
+CREATE OR REPLACE TASK DB_TEAM1.BRONZE.TASK_SILVER_STORE
+    WAREHOUSE = SNOWFLAKE_LEARNING_WH
+    COMMENT   = 'Full refresh of Silver Store from Bronze, runs after primary load'
+    AFTER DB_TEAM1.BRONZE.TASK_DAILY_BRONZE_LOAD
+    -- NO WHEN clause: fires unconditionally (stream gate removed 2026-07-21)
+AS
+CREATE OR REPLACE TABLE DB_TEAM1.SILVER.STORE AS
+SELECT
+    CHANNEL_DESC, CHANNEL_ID,
+    STORE_ID::NUMBER                        AS STORE_ID,
+    STORE_NAME, STORE_STATUS,
+    TRY_TO_DATE(STORE_OPEN_DATE::STRING)    AS STORE_OPEN_DATE,
+    TRY_TO_DATE(STORE_CLOSE_DATE::STRING)   AS STORE_CLOSE_DATE,
+    STORE_TYPE,
+    LONGITUDE::FLOAT                        AS LONGITUDE,
+    LATITUDE::FLOAT                         AS LATITUDE,
+    COUNTRY, DISTRICT, REGION, CITY, STATE, ZIPCODE,
+    LOCATION_TYPE, CLIMATE,
+    TOTAL_STORE_AREA::NUMBER                AS TOTAL_STORE_AREA,
+    STORE_SELLING_AREA::NUMBER              AS STORE_SELLING_AREA,
+    TRAFFIC::NUMBER                         AS TRAFFIC,
+    LIKE_STORE_ID, STORE_TIER_GRADE,
+    TRY_TO_DATE(COMP_DATE::STRING)          AS COMP_DATE,
+    COMP_STATUS, PERIMETER,
+    TRY_TO_TIMESTAMP(
+        REPLACE(CREATED_TIMESTAMP, '-', ' '),
+        'YYYY MM DD HH24.MI.SS.FF6'
+    )                                       AS CREATED_TIMESTAMP,
+    TRY_TO_TIMESTAMP(
+        REPLACE(UPDATED_TIMESTAMP, '-', ' '),
+        'YYYY MM DD HH24.MI.SS.FF6'
+    )                                       AS UPDATED_TIMESTAMP,
+    _SOURCE_FILE, _LOADED_AT,
+    CURRENT_TIMESTAMP()                     AS _STAGED_AT,
+    CASE WHEN STORE_ID IS NULL     THEN 'FAIL' ELSE 'PASS' END AS DQ_STORE_ID,
+    CASE WHEN STORE_NAME IS NULL   THEN 'FAIL' ELSE 'PASS' END AS DQ_STORE_NAME,
+    CASE WHEN STORE_STATUS IS NULL THEN 'FAIL' ELSE 'PASS' END AS DQ_STORE_STATUS,
+    CASE WHEN STORE_OPEN_DATE IS NULL THEN 'FAIL' ELSE 'PASS' END AS DQ_OPEN_DATE
+FROM (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY STORE_ID
+            ORDER BY _LOADED_AT DESC
+        ) AS RN
+    FROM DB_TEAM1.BRONZE.STORE
+)
+WHERE RN = 1;
+
+
+-- ============================================================
+-- ACTIVATE — children first, root last
+-- ============================================================
+ALTER TASK DB_TEAM1.BRONZE.TASK_GOLD_REFRESH         RESUME;
+ALTER TASK DB_TEAM1.BRONZE.TASK_SILVER_TRANSACTIONS  RESUME;
+ALTER TASK DB_TEAM1.BRONZE.TASK_SILVER_INVENTORY     RESUME;
+ALTER TASK DB_TEAM1.BRONZE.TASK_SILVER_PRODUCT       RESUME;
+ALTER TASK DB_TEAM1.BRONZE.TASK_SILVER_STORE         RESUME;
+ALTER TASK DB_TEAM1.BRONZE.TASK_DAILY_BRONZE_LOAD    RESUME;
+
+-- verify
+SHOW TASKS IN SCHEMA DB_TEAM1.BRONZE;
